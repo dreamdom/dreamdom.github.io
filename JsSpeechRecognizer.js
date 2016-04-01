@@ -24,6 +24,10 @@ function JsSpeechRecognizer() {
     this.modelBuffer = [];
     this.groupedValues = [];
 
+    // Keyword spotting variables for recording data
+    this.keywordSpottingGroupBuffer = [];
+    this.keywordSpottingRecordingBuffer = [];
+
     // The speech recognition model
     this.model = {};
 
@@ -49,6 +53,13 @@ function JsSpeechRecognizer() {
     this.numGroups = 25;
     this.groupSize = 10;
     this.minPower = 0.01;
+
+    // Keyword spotting parameters
+    this.keywordSpottingMinConfidence = 0.50;
+    this.keywordSpottingBufferCount = 80;
+    this.keywordSpottingLastVoiceActivity = 0;
+    this.keywordSpottingMaxVoiceActivityGap = 300;
+    this.keywordSpottedCallback = null;
 
     // Create the scriptNode
     this.scriptNode = this.audioCtx.createScriptProcessor(this.analyser.fftSize, 1, 1);
@@ -103,8 +114,8 @@ function JsSpeechRecognizer() {
             for (var j = 0; j < _this.groupSize; j++) {
                 var curPos = (_this.groupSize * i) + j;
 
-                // normalize the value
-                var tempCalc = Math.floor((dataArray[curPos] / max) * 100);
+                // now normalizing after the recording has finished
+                var tempCalc = dataArray[curPos];
 
                 // Keep the peak normalized value for this group
                 if (tempCalc > peakGroupValue) {
@@ -117,7 +128,16 @@ function JsSpeechRecognizer() {
 
         // Depending on the state, handle the data differently
         if (_this.recordingState === _this.RecordingEnum.KEYWORD_SPOTTING) {
-            // Perform keyword spotting...
+
+            // Check if we should reset the buffers
+            var now = new Date().getTime();
+            if (now - _this.keywordSpottingLastVoiceActivity > _this.keywordSpottingMaxVoiceActivityGap) {
+                _this.keywordSpottingGroupBuffer = [];
+                _this.keywordSpottingRecordingBuffer = [];
+            }
+            _this.keywordSpottingLastVoiceActivity = now;
+
+            _this.keywordSpottingProcessFrame(groups, curFrame);
         } else {
             _this.groupedValues.push(groups);
         }
@@ -186,9 +206,22 @@ JsSpeechRecognizer.prototype.startRecognitionRecording = function() {
     this.groupedValues = [];
 };
 
+JsSpeechRecognizer.prototype.startKeywordSpottingRecording = function() {
+    this.recordingState = this.RecordingEnum.KEYWORD_SPOTTING;
+
+    // Create a new current recording buffer
+    this.currentRecordingBuffer = [];
+
+    // Create a new groupedValues buffer
+    this.groupedValues = [];
+};
+
 JsSpeechRecognizer.prototype.stopRecording = function() {
 
     this.groupedValues = [].concat.apply([], this.groupedValues);
+
+    // normalize!
+    this.normalizeInput(this.groupedValues);
 
     // If we are training we want to save to the recongition model
     if (this.recordingState === this.RecordingEnum.TRAINING) {
@@ -205,10 +238,17 @@ JsSpeechRecognizer.prototype.stopRecording = function() {
  * Function will play back the recorded audio for a specific index that is part of the training data.
  */
 JsSpeechRecognizer.prototype.playTrainingBuffer = function(index) {
+    this.playMonoAudio(this.recordingBufferArray[index]);
+};
+
+JsSpeechRecognizer.prototype.deleteTrainingBuffer = function(input) {
+    this.modelBuffer[input] = null;
+};
+
+JsSpeechRecognizer.prototype.playMonoAudio = function(playBuffer) {
 
     // Mono
     var channels = 1;
-    var playBuffer = this.recordingBufferArray[index];
     var frameCount = playBuffer.length;
     var myArrayBuffer = this.audioCtx.createBuffer(channels, frameCount, this.audioCtx.sampleRate);
 
@@ -219,17 +259,8 @@ JsSpeechRecognizer.prototype.playTrainingBuffer = function(index) {
         }
     }
 
-    this.playMonoAudio(myArrayBuffer);
-
-};
-
-JsSpeechRecognizer.prototype.deleteTrainingBuffer = function(input) {
-    this.modelBuffer[input] = null;
-};
-
-JsSpeechRecognizer.prototype.playMonoAudio = function(playBuffer) {
     var playSource = this.audioCtx.createBufferSource();
-    playSource.buffer = playBuffer;
+    playSource.buffer = myArrayBuffer;
     playSource.connect(this.audioCtx.destination);
     playSource.start();
 };
@@ -241,6 +272,8 @@ JsSpeechRecognizer.prototype.generateModel = function() {
 
     // Local vars
     var i = 0;
+    var j = 0;
+    var k = 0;
     var key = "";
 
     // Reset the model
@@ -264,7 +297,7 @@ JsSpeechRecognizer.prototype.generateModel = function() {
     for (key in this.model) {
         var average = [];
         for (i = 0; i < this.model[key].length; i++) {
-            for (var j = 0; j < this.model[key][i].length; j++) {
+            for (j = 0; j < this.model[key][i].length; j++) {
                 average[j] = (average[j] || 0) + (this.model[key][i][j] / this.model[key].length);
             }
         }
@@ -273,19 +306,39 @@ JsSpeechRecognizer.prototype.generateModel = function() {
         this.averageModel[key].push(average);
     }
 
+    // Interpolation - Take the average of each pair of entries for a key and 
+    // add it to the average model
+    for (key in this.model) {
+
+        var averageInterpolation = [];
+        for (k = 0; k < this.model[key].length; k++) {
+            for (i = k + 1; i < this.model[key].length; i++) {
+
+                averageInterpolation = [];
+                for (j = 0; j < Math.max(this.model[key][k].length, this.model[key][i].length); j++) {
+                    var entryOne = this.model[key][k][j] || 0;
+                    var entryTwo = this.model[key][i][j] || 0;
+                    averageInterpolation[j] = (entryOne + entryTwo) / 2;
+                }
+
+                this.averageModel[key].push(averageInterpolation);
+            }
+        }
+    }
+
 };
 
 
 JsSpeechRecognizer.prototype.getTopRecognitionHypotheses = function(numResults) {
 
     if (this.useRecognitionModel === this.RecognitionModel.AVERAGE) {
-        return this.findClosestMatch(this.groupedValues, numResults, this.averageModel);
+        return this.findClosestMatch(this.groupedValues, numResults, this.averageModel, this.findDistance);
     } else if (this.useRecognitionModel === this.RecognitionModel.TRAINED) {
-        return this.findClosestMatch(this.groupedValues, numResults, this.model);
+        return this.findClosestMatch(this.groupedValues, numResults, this.model, this.findDistance);
     } else {
         // For the composite model, combine the trained and average results and sort them
-        var results = this.findClosestMatch(this.groupedValues, -1, this.model);
-        var resultsAverage = this.findClosestMatch(this.groupedValues, -1, this.averageModel);
+        var results = this.findClosestMatch(this.groupedValues, -1, this.model, this.findDistance);
+        var resultsAverage = this.findClosestMatch(this.groupedValues, -1, this.averageModel, this.findDistance);
 
         var allResults = results.concat(resultsAverage);
         allResults.sort(function(a, b) { return b.confidence - a.confidence; });
@@ -294,26 +347,114 @@ JsSpeechRecognizer.prototype.getTopRecognitionHypotheses = function(numResults) 
     }
 };
 
+/**
+ * Function called to process a new frame of data while in recording state KEYWORD_SPOTTING.
+ *  groups - the group data for the frame
+ *  curFrame - the raw audio data for the frame
+ */
+JsSpeechRecognizer.prototype.keywordSpottingProcessFrame = function(groups, curFrame) {
+
+    var computedLength;
+    var key;
+    var allResults = [];
+    var recordingLength;
+    var workingGroupBuffer = [];
+
+    // Append to the keywordspotting buffer
+    this.keywordSpottingGroupBuffer.push(groups);
+    this.keywordSpottingGroupBuffer = [].concat.apply([], this.keywordSpottingGroupBuffer);
+
+    // Trim the buffer if necessary
+    computedLength = (this.keywordSpottingBufferCount * this.numGroups);
+    if (this.keywordSpottingGroupBuffer.length > computedLength) {
+        this.keywordSpottingGroupBuffer = this.keywordSpottingGroupBuffer.slice(this.keywordSpottingGroupBuffer.length - computedLength, this.keywordSpottingGroupBuffer.length);
+    }
+
+    // Save the audio data
+    Array.prototype.push.apply(this.keywordSpottingRecordingBuffer, curFrame);
+
+    // Trim the buffer if necessary
+    computedLength = (this.keywordSpottingBufferCount * this.analyser.fftSize);
+    if (this.keywordSpottingRecordingBuffer.length > computedLength) {
+        this.keywordSpottingRecordingBuffer = this.keywordSpottingRecordingBuffer.slice(this.keywordSpottingRecordingBuffer.length - computedLength, this.keywordSpottingRecordingBuffer.length);
+    }
+
+    // Copy buffer, and normalize it, and use it to find the closest match
+    workingGroupBuffer = this.keywordSpottingGroupBuffer.slice(0);
+    this.normalizeInput(workingGroupBuffer);
+
+    if (this.useRecognitionModel === this.RecognitionModel.AVERAGE) {
+        allResults = this.findClosestMatch(workingGroupBuffer, -1, this.averageModel, this.findDistanceForKeywordSpotting);
+    } else if (this.useRecognitionModel === this.RecognitionModel.TRAINED) {
+        allResults = this.findClosestMatch(workingGroupBuffer, -1, this.model, this.findDistanceForKeywordSpotting);
+    } else {
+        // Using the composite model. Combine the trained and the average
+        var results = this.findClosestMatch(workingGroupBuffer, -1, this.model, this.findDistanceForKeywordSpotting);
+        var resultsAverage = this.findClosestMatch(workingGroupBuffer, -1, this.averageModel, this.findDistanceForKeywordSpotting);
+
+        allResults = results.concat(resultsAverage);
+        allResults.sort(function(a, b) { return b.confidence - a.confidence; });
+    }
+
+    // See if a keyword was spotted
+    if (allResults[0] !== undefined && allResults[0].confidence > this.keywordSpottingMinConfidence) {
+
+        // Save the audio
+        recordingLength = (allResults[0].frameCount / this.numGroups) * this.analyser.fftSize;
+
+        if (recordingLength > this.keywordSpottingRecordingBuffer.length) {
+            recordingLength = this.keywordSpottingRecordingBuffer.length;
+        }
+
+        allResults[0].audioBuffer = this.keywordSpottingRecordingBuffer.slice(this.keywordSpottingRecordingBuffer.length - recordingLength, this.keywordSpottingRecordingBuffer.length);
+
+        // Reset the buffers
+        this.keywordSpottingGroupBuffer = [];
+        this.keywordSpottingRecordingBuffer = [];
+
+        if (this.keywordSpottedCallback !== undefined && this.keywordSpottedCallback !== null) {
+            this.keywordSpottedCallback(allResults[0]);
+        }
+
+    }
+
+};
+
 
 // Calculation functions
 
-JsSpeechRecognizer.prototype.findClosestMatch = function(input, numResults, speechModel) {
+JsSpeechRecognizer.prototype.normalizeInput = function(input) {
+    // Find the max in the fft array
+    var max = Math.max.apply(Math, input);
+
+    for (var i = 0; i < input.length; i++) {
+        input[i] = Math.floor((input[i] / max) * 100);
+    }
+};
+
+JsSpeechRecognizer.prototype.findClosestMatch = function(input, numResults, speechModel, findDistanceFunction) {
 
     var i = 0;
     var key = "";
     var allResults = [];
+
+    // If not findDistance function is defined, used the default
+    if (findDistanceFunction === undefined) {
+        findDistanceFunction = this.findDistanceFunction;
+    }
 
     // Loop through all the keys in the model
     for (key in speechModel) {
         // Loop through all entries for that key
         for (i = 0; i < speechModel[key].length; i++) {
 
-            var curDistance = this.findDistance(input, speechModel[key][i]);
+            var curDistance = findDistanceFunction(input, speechModel[key][i]);
             var curConfidence = this.calcConfidence(curDistance, speechModel[key][i]);
 
             var newResult = {};
             newResult.match = key;
             newResult.confidence = curConfidence;
+            newResult.frameCount = speechModel[key][i].length;
             allResults.push(newResult);
         }
 
@@ -335,6 +476,20 @@ JsSpeechRecognizer.prototype.findDistance = function(input, check) {
     for (i = 0; i < Math.max(input.length, check.length); i++) {
         var checkVal = check[i] || 0;
         var inputVal = input[i] || 0;
+        distance += Math.abs(checkVal - inputVal);
+    }
+
+    return distance;
+};
+
+JsSpeechRecognizer.prototype.findDistanceForKeywordSpotting = function(input, check) {
+    var i = 0;
+    var distance = 0;
+
+    // For keyword spotting we check from the end of the check array, and only the check array length
+    for (i = 0; i < check.length; i++) {
+        var checkVal = check[check.length - i] || 0;
+        var inputVal = input[input.length - i] || 0;
         distance += Math.abs(checkVal - inputVal);
     }
 
